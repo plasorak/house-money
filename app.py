@@ -1,5 +1,5 @@
 import dash
-from dash import html, dcc, callback, Input, Output, State
+from dash import html, dcc, callback, Input, Output, State, PreventUpdate
 import dash_bootstrap_components as dbc
 import pandas as pd
 import plotly.express as px
@@ -9,6 +9,7 @@ import base64
 import io
 import sqlite3
 import os
+
 import hashlib
 
 # Initialize the Dash app
@@ -30,7 +31,7 @@ def init_db():
 
     # Create categories table first
     c.execute('''
-        CREATE TABLE IF NOT EXISTS categories (
+        CREATE TABLE IF NO  T EXISTS categories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
             description TEXT,
