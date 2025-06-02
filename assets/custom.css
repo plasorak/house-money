@@ -1,0 +1,152 @@
+/* Financial Times-inspired theme */
+
+:root {
+    --ft-pink: #FFF1E5;
+    --ft-black: #0D0D0D;
+    --ft-gray: #4D4D4D;
+    --ft-light-gray: #F2F2F2;
+    --ft-border: #E6E6E6;
+    --ft-tab-bg: #F8F8F8;
+}
+
+body {
+    font-family: "Financier Display", "Georgia", serif;
+    color: var(--ft-black);
+    background-color: var(--ft-pink);
+}
+
+/* Header styling */
+h1, h2, h3, h4, h5, h6 {
+    font-family: "Financier Display", "Georgia", serif;
+    font-weight: 500;
+    color: var(--ft-black);
+}
+
+/* Container styling */
+.container {
+    background-color: white;
+    padding: 2rem;
+    border-radius: 4px;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+/* Button styling */
+.btn-primary {
+    background-color: var(--ft-black);
+    border-color: var(--ft-black);
+    color: white;
+}
+
+.btn-primary:hover {
+    background-color: var(--ft-gray);
+    border-color: var(--ft-gray);
+}
+
+/* Table styling */
+.table {
+    border-color: var(--ft-border);
+    background-color: white;
+}
+
+.table thead th {
+    background-color: var(--ft-tab-bg);
+    border-bottom: 2px solid var(--ft-border);
+    font-weight: 500;
+}
+
+.table td {
+    border-color: var(--ft-border);
+    background-color: white;
+}
+
+.table-striped tbody tr:nth-of-type(odd) {
+    background-color: var(--ft-tab-bg);
+}
+
+.table-striped tbody tr:nth-of-type(even) {
+    background-color: white;
+}
+
+/* Form controls */
+.form-control {
+    border-color: var(--ft-border);
+}
+
+.form-control:focus {
+    border-color: var(--ft-gray);
+    box-shadow: 0 0 0 0.2rem rgba(77, 77, 77, 0.25);
+}
+
+/* Tabs styling */
+.nav-tabs {
+    border-bottom: 2px solid var(--ft-border);
+}
+
+.nav-tabs .nav-link {
+    color: var(--ft-gray);
+    border: none;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -2px;
+    padding: 0.75rem 1.25rem;
+    background-color: var(--ft-tab-bg);
+    margin-right: 4px;
+}
+
+.nav-tabs .nav-link:hover {
+    border-color: var(--ft-border);
+    background-color: white;
+}
+
+.nav-tabs .nav-link.active {
+    color: var(--ft-black);
+    background-color: white;
+    border-bottom: 2px solid var(--ft-black);
+    font-weight: 500;
+}
+
+/* Card styling */
+.card {
+    border-color: var(--ft-border);
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+    background-color: white;
+}
+
+/* Modal styling */
+.modal-content {
+    border-color: var(--ft-border);
+    background-color: white;
+}
+
+.modal-header {
+    background-color: var(--ft-tab-bg);
+    border-bottom-color: var(--ft-border);
+}
+
+/* Dropdown styling */
+.dropdown-menu {
+    border-color: var(--ft-border);
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    background-color: white;
+}
+
+.dropdown-item:hover {
+    background-color: var(--ft-tab-bg);
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+    width: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--ft-light-gray);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--ft-gray);
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--ft-black);
+}

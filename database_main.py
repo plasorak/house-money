@@ -1,7 +1,7 @@
 import os
 from database import DB_PATH, reset_database, init_db
 import click
-import rich
+import sqlite3
 from rich.console import Console
 from rich.prompt import Confirm
 
@@ -12,57 +12,56 @@ def cli():
     """Database management utility for House Money"""
     pass
 
-@cli.command('delete')
-def delete_db():
-    """Delete the database file"""
-    if not os.path.exists(DB_PATH):
-        console.print(f"Database file ({DB_PATH}) does not exist. No need to do anything...")
-        return
-
-    # Ask for confirmation
-    if not Confirm.ask(f"WARNING: This will delete ALL data in {DB_PATH}!\nAre you sure you want to continue?"):
-        console.print("Operation cancelled.")
-        return
-
-    try:
-        os.remove(DB_PATH)
-        console.print("[green]Database file has been deleted successfully![/green]")
-    except Exception as e:
-        console.print(f"[red]Error deleting database: {e}[/red]")
-
-@cli.command('reset')
-def reset_db():
-    """Reset the database (drop all tables and recreate)"""
-    if not os.path.exists(DB_PATH):
-        console.print("Database file does not exist. Creating new database...")
-        init_db()
-        console.print("[green]Database has been created successfully![/green]")
-        return
-
-    # Ask for confirmation
-    if not Confirm.ask(f"WARNING: This will delete ALL data in {DB_PATH}!\nAre you sure you want to continue?"):
-        console.print("Operation cancelled.")
-        return
-
-    try:
-        reset_database()
-        console.print("[green]Database has been reset successfully![/green]")
-    except Exception as e:
-        console.print(f"[red]Error resetting database: {e}[/red]")
-
-@cli.command('create')
-def create_db():
-    """Create a new database"""
+@cli.command()
+@click.argument('table', type=click.Choice(['all', 'transactions', 'tags', 'uploaded_files', 'transaction_tags']))
+def init(table):
+    """Initialize a new database or specific table"""
     if os.path.exists(DB_PATH):
-        if not Confirm.ask(f"Database file already exists at {DB_PATH}.\nDo you want to overwrite it?"):
-            console.print("Operation cancelled.")
+        if not Confirm.ask(f"Database already exists at {DB_PATH}. Do you want to reinitialize the {table} table(s)?"):
             return
+    init_db(table)
+    console.print(f"[green]Table(s) initialized at {DB_PATH}[/green]")
 
-    try:
-        init_db()
-        console.print("[green]Database has been created successfully![/green]")
-    except Exception as e:
-        console.print(f"[red]Error creating database: {e}[/red]")
+@cli.command()
+@click.argument('table', type=click.Choice(['all', 'transactions', 'tags', 'uploaded_files', 'transaction_tags']))
+def reset(table):
+    """Reset specific table(s) by dropping and recreating them"""
+    if not os.path.exists(DB_PATH):
+        console.print(f"[yellow]Database does not exist at {DB_PATH}[/yellow]")
+        return
+
+    if not Confirm.ask(f"Are you sure you want to reset the {table} table(s) at {DB_PATH}? This will delete all data in those tables!"):
+        return
+
+    reset_database(table)
+    console.print(f"[green]Table(s) reset at {DB_PATH}[/green]")
+
+@cli.command()
+@click.argument('table', type=click.Choice(['all', 'transactions', 'tags', 'uploaded_files', 'transaction_tags']))
+def delete(table):
+    """Delete specific table(s) from the database"""
+    if not os.path.exists(DB_PATH):
+        console.print(f"[yellow]Database does not exist at {DB_PATH}[/yellow]")
+        return
+
+    if not Confirm.ask(f"Are you sure you want to delete the {table} table(s) from {DB_PATH}?"):
+        return
+
+    # Connect to database and drop the specified table(s)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    if table == 'all':
+        tables = ['transactions', 'tags', 'uploaded_files', 'transaction_tags']
+    else:
+        tables = [table]
+
+    for t in tables:
+        c.execute(f'DROP TABLE IF EXISTS {t}')
+
+    conn.commit()
+    conn.close()
+    console.print(f"[green]Table(s) deleted from {DB_PATH}[/green]")
 
 if __name__ == '__main__':
     cli()

@@ -3,132 +3,149 @@ import os
 import time
 import pandas as pd
 from datetime import datetime
+import threading
 
 # Database setup
 DB_PATH = os.environ.get('HM_DB_PATH', 'transactions.db')
 
-def get_db_connection(timeout=30):
-    """Get a database connection with retry logic."""
-    max_attempts = 5
-    attempt = 0
-    while attempt < max_attempts:
-        try:
-            conn = sqlite3.connect(DB_PATH, timeout=timeout)
-            return conn
-        except sqlite3.OperationalError as e:
-            if "database is locked" in str(e):
-                attempt += 1
-                if attempt == max_attempts:
-                    raise e
-                time.sleep(0.1)  # Wait before retrying
-            else:
-                raise e
+# Thread-local storage for database connections
+thread_local = threading.local()
 
-def init_db():
-    """Initialize the database and create tables if they don't exist."""
+def get_db_connection(timeout=30):
+    """Get a database connection for the current thread."""
+    if not hasattr(thread_local, 'connection'):
+        thread_local.connection = sqlite3.connect(DB_PATH, timeout=timeout)
+        thread_local.connection.row_factory = sqlite3.Row
+    return thread_local.connection
+
+def close_thread_connection():
+    """Close the database connection for the current thread."""
+    if hasattr(thread_local, 'connection'):
+        thread_local.connection.close()
+        del thread_local.connection
+
+def close_all_connections():
+    """Close all thread-local connections."""
+    # This is a no-op since connections are managed per-thread
+    pass
+
+def init_db(table='all'):
+    """Initialize the database and create specified table(s) if they don't exist."""
     conn = None
     try:
         conn = get_db_connection()
         c = conn.cursor()
 
-        # Create tags table if it doesn't exist
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS tags (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                description TEXT,
-                color TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
+        tables_to_create = []
+        if table == 'all' or table == 'tags':
+            tables_to_create.append(('''
+                CREATE TABLE IF NOT EXISTS tags (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    description TEXT,
+                    color TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''', 'tags'))
 
-        # Create uploaded_files table if it doesn't exist
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS uploaded_files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                filename TEXT NOT NULL,
-                sha_256 TEXT NOT NULL UNIQUE,
-                upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                transaction_count INTEGER NOT NULL
-            )
-        ''')
+        if table == 'all' or table == 'uploaded_files':
+            tables_to_create.append(('''
+                CREATE TABLE IF NOT EXISTS uploaded_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    filename TEXT NOT NULL,
+                    sha_256 TEXT NOT NULL UNIQUE,
+                    upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    transaction_count INTEGER NOT NULL
+                )
+            ''', 'uploaded_files'))
 
-        # Create transactions table if it doesn't exist
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL,
-                description TEXT NOT NULL,
-                amount REAL NOT NULL,
-                file_sha_256 TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (file_sha_256) REFERENCES uploaded_files(sha_256)
-            )
-        ''')
+        if table == 'all' or table == 'transactions':
+            tables_to_create.append(('''
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TIMESTAMP NOT NULL,
+                    description TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    file_sha_256 TEXT NOT NULL,
+                    notes TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (file_sha_256) REFERENCES uploaded_files(sha_256)
+                )
+            ''', 'transactions'))
 
-        # Create transaction_tags junction table
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS transaction_tags (
-                transaction_id INTEGER NOT NULL,
-                tag_id INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (transaction_id, tag_id),
-                FOREIGN KEY (transaction_id) REFERENCES transactions(id),
-                FOREIGN KEY (tag_id) REFERENCES tags(id)
-            )
-        ''')
+        if table == 'all' or table == 'transaction_tags':
+            tables_to_create.append(('''
+                CREATE TABLE IF NOT EXISTS transaction_tags (
+                    transaction_id INTEGER NOT NULL,
+                    tag_id INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (transaction_id, tag_id),
+                    FOREIGN KEY (transaction_id) REFERENCES transactions(id),
+                    FOREIGN KEY (tag_id) REFERENCES tags(id)
+                )
+            ''', 'transaction_tags'))
 
-        # Insert default tags if they don't exist
-        default_tags = [
-            ('Groceries', 'Food, household items, and daily essentials', '#FF9999'),
-            ('Dining', 'Restaurants, cafes, and takeout food', '#99FF99'),
-            ('Transportation', 'Gas, public transit, car maintenance, and rideshares', '#9999FF'),
-            ('Shopping', 'Retail purchases, clothing, and personal items', '#FFFF99'),
-            ('Entertainment', 'Movies, events, hobbies, and leisure activities', '#FF99FF'),
-            ('Utilities', 'Electricity, water, gas, internet, and phone bills', '#99FFFF'),
-            ('Housing', 'Rent, mortgage, property taxes, and home maintenance', '#FFB366'),
-            ('Healthcare', 'Medical expenses, prescriptions, and insurance', '#FF6666'),
-            ('Education', 'Tuition, books, courses, and educational materials', '#66B366'),
-            ('Travel', 'Vacations, business trips, and travel expenses', '#B366B3'),
-            ('Gifts', 'Gifts, donations, and charitable contributions', '#66B3B3'),
-            ('Personal Care', 'Haircuts, beauty products, and wellness services', '#B3B366'),
-            ('Investments', 'Savings, investments, and retirement contributions', '#4D4D4D'),
-            ('Income', 'Salary, bonuses, and other income sources', '#4CAF50'),
-            ('Subscriptions', 'Streaming services, software, and memberships', '#9C27B0'),
-            ('Insurance', 'Health, auto, home, and other insurance premiums', '#2196F3')
-        ]
-        c.executemany('''
-            INSERT OR IGNORE INTO tags (name, description, color)
-            VALUES (?, ?, ?)
-        ''', default_tags)
+        for create_sql, table_name in tables_to_create:
+            c.execute(create_sql)
+            print(f"Created table: {table_name}")
+
+        # Insert default tags if we're creating the tags table
+        if table == 'all' or table == 'tags':
+            default_tags = [
+                ('Groceries', 'Food, household items, and daily essentials', '#FF9999'),
+                ('Dining', 'Restaurants, cafes, and takeout food', '#99FF99'),
+                ('Transportation', 'Gas, public transit, car maintenance, and rideshares', '#9999FF'),
+                ('Shopping', 'Retail purchases, clothing, and personal items', '#FFFF99'),
+                ('Entertainment', 'Movies, events, hobbies, and leisure activities', '#FF99FF'),
+                ('Utilities', 'Electricity, water, gas, internet, and phone bills', '#99FFFF'),
+                ('Housing', 'Rent, mortgage, property taxes, and home maintenance', '#FFB366'),
+                ('Healthcare', 'Medical expenses, prescriptions, and insurance', '#FF6666'),
+                ('Education', 'Tuition, books, courses, and educational materials', '#66B366'),
+                ('Travel', 'Vacations, business trips, and travel expenses', '#B366B3'),
+                ('Gifts', 'Gifts, donations, and charitable contributions', '#66B3B3'),
+                ('Personal Care', 'Haircuts, beauty products, and wellness services', '#B3B366'),
+                ('Investments', 'Savings, investments, and retirement contributions', '#4D4D4D'),
+                ('Income', 'Salary, bonuses, and other income sources', '#4CAF50'),
+                ('Subscriptions', 'Streaming services, software, and memberships', '#9C27B0'),
+                ('Insurance', 'Health, auto, home, and other insurance premiums', '#2196F3')
+            ]
+            c.executemany('''
+                INSERT OR IGNORE INTO tags (name, description, color)
+                VALUES (?, ?, ?)
+            ''', default_tags)
+            print("Inserted default tags")
 
         conn.commit()
     finally:
         if conn:
             conn.close()
 
-def reset_database():
-    """Reset the database by dropping all tables and recreating them.
-    WARNING: This will delete all existing data!
+def reset_database(table='all'):
+    """Reset specified table(s) by dropping and recreating them.
+    WARNING: This will delete all data in the specified table(s)!
     """
     conn = None
     try:
         conn = get_db_connection()
         c = conn.cursor()
 
-        # Drop existing tables
-        c.execute('DROP TABLE IF EXISTS transaction_tags')
-        c.execute('DROP TABLE IF EXISTS transactions')
-        c.execute('DROP TABLE IF EXISTS uploaded_files')
-        c.execute('DROP TABLE IF EXISTS tags')
+        # Drop specified tables
+        if table == 'all':
+            tables = ['transaction_tags', 'transactions', 'uploaded_files', 'tags']
+        else:
+            tables = [table]
+
+        for t in tables:
+            c.execute(f'DROP TABLE IF EXISTS {t}')
+            print(f"Dropped table: {t}")
 
         conn.commit()
     finally:
         if conn:
             conn.close()
 
-    # Reinitialize the database
-    init_db()
+    # Reinitialize the specified table(s)
+    init_db(table)
 
 def get_tags():
     """Get all tags from the database."""
@@ -137,7 +154,7 @@ def get_tags():
         df = pd.read_sql_query("SELECT * FROM tags ORDER BY name", conn)
         return df
     finally:
-        conn.close()
+        close_thread_connection()
 
 def add_tag(name, description, color):
     """Add a new tag to the database."""
@@ -153,7 +170,7 @@ def add_tag(name, description, color):
     except sqlite3.IntegrityError:
         return False
     finally:
-        conn.close()
+        close_thread_connection()
 
 def update_tag(tag_id, name, description, color):
     """Update an existing tag."""
@@ -170,7 +187,7 @@ def update_tag(tag_id, name, description, color):
     except sqlite3.IntegrityError:
         return False
     finally:
-        conn.close()
+        close_thread_connection()
 
 def delete_tag(tag_id):
     """Delete a tag."""
@@ -183,7 +200,7 @@ def delete_tag(tag_id):
     except sqlite3.IntegrityError:
         return False
     finally:
-        conn.close()
+        close_thread_connection()
 
 def save_file_info(filename, sha_256, transaction_count):
     """Save file information to the database."""
@@ -200,20 +217,30 @@ def save_file_info(filename, sha_256, transaction_count):
         # File hash already exists
         return False
     finally:
-        conn.close()
+        close_thread_connection()
 
 def get_uploaded_files():
     """Get list of uploaded files from the database."""
+    print("Getting uploaded files from database...")
     conn = get_db_connection()
     try:
+        # First check if the table exists
+        c = conn.cursor()
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='uploaded_files'")
+        if not c.fetchone():
+            print("uploaded_files table does not exist")
+            return pd.DataFrame()
+
+        # Get the files
         df = pd.read_sql_query("""
             SELECT filename, upload_date, transaction_count, sha_256
             FROM uploaded_files
             ORDER BY upload_date DESC
         """, conn)
+        print(f"Found {len(df)} files in database")
         return df
     finally:
-        conn.close()
+        close_thread_connection()
 
 def save_transactions(df, sha_256):
     """Save transactions to the database."""
@@ -224,16 +251,20 @@ def save_transactions(df, sha_256):
         # Get tag IDs
         tags = {row[1]: row[0] for row in c.execute("SELECT id, name FROM tags")}
 
-        # Add file_sha_256 column
-        df['file_sha_256'] = sha_256
+        # Create a copy of the DataFrame to avoid modifying the original
+        df_copy = df.copy()
+        df_copy['file_sha_256'] = sha_256
+
+        # Convert date to ISO format timestamp
+        df_copy['Date'] = df_copy['Date'].dt.strftime('%Y-%m-%d %H:%M:%S')
 
         # Save transactions
-        for _, row in df.iterrows():
+        for _, row in df_copy.iterrows():
             # Insert transaction
             c.execute('''
-                INSERT INTO transactions (date, description, amount, file_sha_256)
-                VALUES (?, ?, ?, ?)
-            ''', (row['Date'], row['Description'], row['Amount'], sha_256))
+                INSERT INTO transactions (date, description, amount, file_sha_256, notes)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (row['Date'], row['Description'], row['Amount'], sha_256, row.get('Notes', '')))
 
             transaction_id = c.lastrowid
 
@@ -251,7 +282,7 @@ def save_transactions(df, sha_256):
 
         conn.commit()
     finally:
-        conn.close()
+        close_thread_connection()
 
 def load_transactions():
     """Load all transactions from the database."""
@@ -262,7 +293,7 @@ def load_transactions():
     try:
         # Get transactions with their tags
         df = pd.read_sql_query("""
-            SELECT t.id, t.date, t.description, t.amount,
+            SELECT t.id, t.date, t.description, t.amount, t.notes,
                    GROUP_CONCAT(tg.name) as tags,
                    t.file_sha_256, f.filename
             FROM transactions t
@@ -274,18 +305,20 @@ def load_transactions():
         """, conn)
 
         if not df.empty:
-            df['Date'] = pd.to_datetime(df['date'])
+            df['date'] = pd.to_datetime(df['date'])
             df = df.rename(columns={
                 'date': 'Date',
                 'description': 'Description',
                 'amount': 'Amount',
+                'notes': 'Notes',
                 'tags': 'Tags',
                 'file_sha_256': 'File SHA-256',
                 'filename': 'Source File'
             })
+
         return df
     finally:
-        conn.close()
+        close_thread_connection()
 
 def update_transaction_tags(transaction_id, tag_ids):
     """Update the tags of a transaction."""
@@ -308,13 +341,154 @@ def update_transaction_tags(transaction_id, tag_ids):
         print(f"Error updating transaction tags: {e}")
         return False
     finally:
-        conn.close()
+        close_thread_connection()
 
-def get_tag_options():
-    """Get tags for dropdown options."""
+def update_transaction_note(transaction_id, note):
+    """Update the note of a transaction."""
     conn = get_db_connection()
     try:
-        df = pd.read_sql_query("SELECT id, name, color FROM tags ORDER BY name", conn)
-        return [{'label': row['name'], 'value': row['id'], 'style': {'color': row['color']}} for _, row in df.iterrows()]
+        c = conn.cursor()
+        c.execute('''
+            UPDATE transactions
+            SET notes = ?
+            WHERE id = ?
+        ''', (note, transaction_id))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error updating transaction note: {e}")
+        return False
     finally:
-        conn.close()
+        close_thread_connection()
+
+def get_tag_name_to_id_mapping():
+    """Get a mapping of tag names to their IDs."""
+    conn = get_db_connection()
+    try:
+        return {row[1]: row[0] for row in conn.execute("SELECT id, name FROM tags")}
+    finally:
+        close_thread_connection()
+
+def create_manual_transaction(date, description, amount, notes=None, tags=None):
+    """Create a new transaction manually.
+
+    Args:
+        date (datetime): Transaction date and time
+        description (str): Transaction description
+        amount (float): Transaction amount
+        notes (str, optional): Transaction notes
+        tags (list, optional): List of tag IDs to associate with the transaction
+
+    Returns:
+        int: The ID of the newly created transaction, or None if creation failed
+    """
+    conn = get_db_connection()
+    try:
+        c = conn.cursor()
+        # Insert transaction
+        c.execute('''
+            INSERT INTO transactions (date, description, amount, notes, file_sha_256)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (date, description, amount, notes, 'manual_entry'))
+
+        transaction_id = c.lastrowid
+
+        # Add tags if any
+        if tags:
+            for tag_id in tags:
+                c.execute('''
+                    INSERT INTO transaction_tags (transaction_id, tag_id)
+                    VALUES (?, ?)
+                ''', (transaction_id, tag_id))
+
+        conn.commit()
+        return transaction_id
+    except Exception as e:
+        print(f"Error creating manual transaction: {e}")
+        return None
+    finally:
+        close_thread_connection()
+
+def load_transactions_with_sort(sort_column='date', ascending=True, search_text=None, search_text_on=None):
+    """Load transactions from the database with sorting and optional search applied."""
+    conn = get_db_connection()
+    try:
+        # Validate sort column to prevent SQL injection
+        valid_columns = ['date', 'description', 'amount']
+        sort_column = sort_column.lower()
+        if sort_column not in valid_columns:
+            sort_column = 'date'
+
+        # Map column names to their table-qualified versions
+        column_map = {
+            'date': 't.date',
+            'description': 't.description',
+            'amount': 't.amount'
+        }
+
+        # Build the query with sorting and optional search
+        query = f"""
+        SELECT t.id, t.date, t.description, t.amount, t.notes,
+               GROUP_CONCAT(tg.name) as tags,
+               t.file_sha_256, f.filename as source_file
+        FROM transactions t
+        LEFT JOIN transaction_tags tt ON t.id = tt.transaction_id
+        LEFT JOIN tags tg ON tt.tag_id = tg.id
+        LEFT JOIN uploaded_files f ON t.file_sha_256 = f.sha_256
+        WHERE 1=1
+        """
+
+        # Add search condition if search_text is provided
+        if search_text:
+            query += f" AND {column_map[search_text_on]} LIKE '%{search_text}%'"
+
+        query += f"""
+        GROUP BY t.id
+        ORDER BY {column_map[sort_column]} {'ASC' if ascending else 'DESC'}
+        """
+
+        df = pd.read_sql_query(query, conn)
+
+        # Convert date strings to datetime
+        df['date'] = pd.to_datetime(df['date'])
+
+        # Rename columns to match expected format
+        df = df.rename(columns={
+            'date': 'Date',
+            'description': 'Description',
+            'amount': 'Amount',
+            'notes': 'Notes',
+            'tags': 'Tags',
+            'file_sha_256': 'File SHA-256',
+            'source_file': 'Source File'
+        })
+
+        return df
+    finally:
+        close_thread_connection()
+
+def delete_transactions(transaction_ids):
+    """Delete multiple transactions by their IDs.
+
+    Args:
+        transaction_ids (list): List of transaction IDs to delete
+
+    Returns:
+        bool: True if deletion was successful, False otherwise
+    """
+    conn = get_db_connection()
+    try:
+        c = conn.cursor()
+        # First delete associated tags
+        c.executemany('DELETE FROM transaction_tags WHERE transaction_id = ?',
+                     [(id,) for id in transaction_ids])
+        # Then delete the transactions
+        c.executemany('DELETE FROM transactions WHERE id = ?',
+                     [(id,) for id in transaction_ids])
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error deleting transactions: {e}")
+        return False
+    finally:
+        close_thread_connection()
