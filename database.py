@@ -4,12 +4,55 @@ import time
 import pandas as pd
 from datetime import datetime
 import threading
+from typing import Dict, Any
 
 # Database setup
 DB_PATH = os.environ.get('HM_DB_PATH', 'transactions.db')
 
 # Thread-local storage for database connections
 thread_local = threading.local()
+
+# Cache configuration
+CACHE_TTL = 300  # 5 minutes in seconds
+_cache_lock = threading.Lock()
+_cache_timestamps: Dict[str, float] = {}
+_cache: Dict[str, Any] = {}
+
+def _invalidate_cache(cache_name: str = None):
+    """Invalidate specific cache or all caches if no name provided."""
+    with _cache_lock:
+        if cache_name:
+            _cache_timestamps.pop(cache_name, None)
+            _cache.pop(cache_name, None)
+            # If invalidating transactions cache, also invalidate all sorted transaction caches
+            if cache_name == 'transactions':
+                # Remove all cache keys that start with 'transactions_sort_'
+                keys_to_remove = [k for k in _cache_timestamps.keys() if k.startswith('transactions_sort_')]
+                for k in keys_to_remove:
+                    _cache_timestamps.pop(k)
+                    _cache.pop(k)
+        else:
+            _cache_timestamps.clear()
+            _cache.clear()
+
+def _is_cache_valid(cache_name: str) -> bool:
+    """Check if cache is still valid based on TTL."""
+    with _cache_lock:
+        timestamp = _cache_timestamps.get(cache_name)
+        if timestamp is None:
+            return False
+        return (time.time() - timestamp) < CACHE_TTL
+
+def _update_cache(cache_name: str, data: Any):
+    """Update the cache with new data."""
+    with _cache_lock:
+        _cache[cache_name] = data
+        _cache_timestamps[cache_name] = time.time()
+
+def _get_cache(cache_name: str):
+    """Get the cache for a given name."""
+    with _cache_lock:
+        return _cache.get(cache_name, None)
 
 def get_db_connection(timeout=30):
     """Get a database connection for the current thread."""
@@ -149,12 +192,16 @@ def reset_database(table='all'):
 
 def get_tags():
     """Get all tags from the database."""
-    conn = get_db_connection()
-    try:
-        df = pd.read_sql_query("SELECT * FROM tags ORDER BY name", conn)
-        return df
-    finally:
-        close_thread_connection()
+    if not _is_cache_valid('tags'):
+        conn = get_db_connection()
+        try:
+            df = pd.read_sql_query("SELECT * FROM tags ORDER BY name", conn)
+            _update_cache('tags', df)
+            return df
+        finally:
+            close_thread_connection()
+    cached_data = _get_cache('tags')
+    return cached_data if cached_data is not None else pd.DataFrame()
 
 def add_tag(name, description, color):
     """Add a new tag to the database."""
@@ -166,6 +213,7 @@ def add_tag(name, description, color):
             VALUES (?, ?, ?)
         ''', (name, description, color))
         conn.commit()
+        _invalidate_cache('tags')
         return True
     except sqlite3.IntegrityError:
         return False
@@ -183,6 +231,7 @@ def update_tag(tag_id, name, description, color):
             WHERE id = ?
         ''', (name, description, color, tag_id))
         conn.commit()
+        _invalidate_cache('tags')  # Only need to invalidate tags cache
         return True
     except sqlite3.IntegrityError:
         return False
@@ -196,6 +245,7 @@ def delete_tag(tag_id):
         c = conn.cursor()
         c.execute('DELETE FROM tags WHERE id = ?', (tag_id,))
         conn.commit()
+        _invalidate_cache('tags')  # Only need to invalidate tags cache
         return True
     except sqlite3.IntegrityError:
         return False
@@ -212,6 +262,7 @@ def save_file_info(filename, sha_256, transaction_count):
             VALUES (?, ?, ?)
         ''', (filename, sha_256, transaction_count))
         conn.commit()
+        _invalidate_cache('uploaded_files')
         return True
     except sqlite3.IntegrityError:
         # File hash already exists
@@ -221,26 +272,30 @@ def save_file_info(filename, sha_256, transaction_count):
 
 def get_uploaded_files():
     """Get list of uploaded files from the database."""
-    print("Getting uploaded files from database...")
-    conn = get_db_connection()
-    try:
-        # First check if the table exists
-        c = conn.cursor()
-        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='uploaded_files'")
-        if not c.fetchone():
-            print("uploaded_files table does not exist")
-            return pd.DataFrame()
+    if not _is_cache_valid('uploaded_files'):
+        print("Getting uploaded files from database...")
+        conn = get_db_connection()
+        try:
+            # First check if the table exists
+            c = conn.cursor()
+            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='uploaded_files'")
+            if not c.fetchone():
+                print("uploaded_files table does not exist")
+                return pd.DataFrame()
 
-        # Get the files
-        df = pd.read_sql_query("""
-            SELECT filename, upload_date, transaction_count, sha_256
-            FROM uploaded_files
-            ORDER BY upload_date DESC
-        """, conn)
-        print(f"Found {len(df)} files in database")
-        return df
-    finally:
-        close_thread_connection()
+            # Get the files
+            df = pd.read_sql_query("""
+                SELECT filename, upload_date, transaction_count, sha_256
+                FROM uploaded_files
+                ORDER BY upload_date DESC
+            """, conn)
+            print(f"Found {len(df)} files in database")
+            _update_cache('uploaded_files', df)
+            return df
+        finally:
+            close_thread_connection()
+    cached_data = _get_cache('uploaded_files')
+    return cached_data if cached_data is not None else pd.DataFrame()
 
 def save_transactions(df, sha_256):
     """Save transactions to the database."""
@@ -281,44 +336,48 @@ def save_transactions(df, sha_256):
                         ''', (transaction_id, tags[tag_name]))
 
         conn.commit()
+        _invalidate_cache('transactions')
     finally:
         close_thread_connection()
 
 def load_transactions():
     """Load all transactions from the database."""
-    if not os.path.exists(DB_PATH):
-        return pd.DataFrame()
+    if not _is_cache_valid('transactions'):
+        if not os.path.exists(DB_PATH):
+            return pd.DataFrame()
 
-    conn = get_db_connection()
-    try:
-        # Get transactions with their tags
-        df = pd.read_sql_query("""
-            SELECT t.id, t.date, t.description, t.amount, t.notes,
-                   GROUP_CONCAT(tg.name) as tags,
-                   t.file_sha_256, f.filename
-            FROM transactions t
-            LEFT JOIN transaction_tags tt ON t.id = tt.transaction_id
-            LEFT JOIN tags tg ON tt.tag_id = tg.id
-            JOIN uploaded_files f ON t.file_sha_256 = f.sha_256
-            GROUP BY t.id
-            ORDER BY t.date DESC
-        """, conn)
+        conn = get_db_connection()
+        try:
+            # Get transactions with their tags
+            df = pd.read_sql_query("""
+                SELECT t.id, t.date, t.description, t.amount, t.notes,
+                       GROUP_CONCAT(tg.name) as tags,
+                       t.file_sha_256, f.filename
+                FROM transactions t
+                LEFT JOIN transaction_tags tt ON t.id = tt.transaction_id
+                LEFT JOIN tags tg ON tt.tag_id = tg.id
+                JOIN uploaded_files f ON t.file_sha_256 = f.sha_256
+                GROUP BY t.id
+                ORDER BY t.date DESC
+            """, conn)
 
-        if not df.empty:
-            df['date'] = pd.to_datetime(df['date'])
-            df = df.rename(columns={
-                'date': 'Date',
-                'description': 'Description',
-                'amount': 'Amount',
-                'notes': 'Notes',
-                'tags': 'Tags',
-                'file_sha_256': 'File SHA-256',
-                'filename': 'Source File'
-            })
-
-        return df
-    finally:
-        close_thread_connection()
+            if not df.empty:
+                df['date'] = pd.to_datetime(df['date'])
+                df = df.rename(columns={
+                    'date': 'Date',
+                    'description': 'Description',
+                    'amount': 'Amount',
+                    'notes': 'Notes',
+                    'tags': 'Tags',
+                    'file_sha_256': 'File SHA-256',
+                    'filename': 'Source File'
+                })
+            _update_cache('transactions', df)
+            return df
+        finally:
+            close_thread_connection()
+    cached_data = _get_cache('transactions')
+    return cached_data if cached_data is not None else pd.DataFrame()
 
 def update_transaction_tags(transaction_id, tag_ids):
     """Update the tags of a transaction."""
@@ -336,6 +395,7 @@ def update_transaction_tags(transaction_id, tag_ids):
             ''', (transaction_id, tag_id))
 
         conn.commit()
+        _invalidate_cache('transactions')
         return True
     except Exception as e:
         print(f"Error updating transaction tags: {e}")
@@ -354,6 +414,7 @@ def update_transaction_note(transaction_id, note):
             WHERE id = ?
         ''', (note, transaction_id))
         conn.commit()
+        _invalidate_cache('transactions')
         return True
     except Exception as e:
         print(f"Error updating transaction note: {e}")
@@ -363,11 +424,16 @@ def update_transaction_note(transaction_id, note):
 
 def get_tag_name_to_id_mapping():
     """Get a mapping of tag names to their IDs."""
-    conn = get_db_connection()
-    try:
-        return {row[1]: row[0] for row in conn.execute("SELECT id, name FROM tags")}
-    finally:
-        close_thread_connection()
+    if not _is_cache_valid('tags'):
+        conn = get_db_connection()
+        try:
+            mapping = {row[1]: row[0] for row in conn.execute("SELECT id, name FROM tags")}
+            _update_cache('tag_mapping', mapping)
+            return mapping
+        finally:
+            close_thread_connection()
+    cached_data = _get_cache('tag_mapping')
+    return cached_data if cached_data is not None else {}
 
 def create_manual_transaction(date, description, amount, notes=None, tags=None):
     """Create a new transaction manually.
@@ -402,6 +468,7 @@ def create_manual_transaction(date, description, amount, notes=None, tags=None):
                 ''', (transaction_id, tag_id))
 
         conn.commit()
+        _invalidate_cache('transactions')
         return transaction_id
     except Exception as e:
         print(f"Error creating manual transaction: {e}")
@@ -411,61 +478,65 @@ def create_manual_transaction(date, description, amount, notes=None, tags=None):
 
 def load_transactions_with_sort(sort_column='date', ascending=True, search_text=None, search_text_on=None):
     """Load transactions from the database with sorting and optional search applied."""
-    conn = get_db_connection()
-    try:
-        # Validate sort column to prevent SQL injection
-        valid_columns = ['date', 'description', 'amount']
-        sort_column = sort_column.lower()
-        if sort_column not in valid_columns:
-            sort_column = 'date'
+    cache_key = f"transactions_sort_{sort_column}_{ascending}_{search_text}_{search_text_on}"
+    if not _is_cache_valid(cache_key):
+        conn = get_db_connection()
+        try:
+            # Validate sort column to prevent SQL injection
+            valid_columns = ['date', 'description', 'amount']
+            sort_column = sort_column.lower()
+            if sort_column not in valid_columns:
+                sort_column = 'date'
 
-        # Map column names to their table-qualified versions
-        column_map = {
-            'date': 't.date',
-            'description': 't.description',
-            'amount': 't.amount'
-        }
+            # Map column names to their table-qualified versions
+            column_map = {
+                'date': 't.date',
+                'description': 't.description',
+                'amount': 't.amount'
+            }
 
-        # Build the query with sorting and optional search
-        query = f"""
-        SELECT t.id, t.date, t.description, t.amount, t.notes,
-               GROUP_CONCAT(tg.name) as tags,
-               t.file_sha_256, f.filename as source_file
-        FROM transactions t
-        LEFT JOIN transaction_tags tt ON t.id = tt.transaction_id
-        LEFT JOIN tags tg ON tt.tag_id = tg.id
-        LEFT JOIN uploaded_files f ON t.file_sha_256 = f.sha_256
-        WHERE 1=1
-        """
+            # Build the query with sorting and optional search
+            query = f"""
+            SELECT t.id, t.date, t.description, t.amount, t.notes,
+                   GROUP_CONCAT(tg.name) as tags,
+                   t.file_sha_256, f.filename as source_file
+            FROM transactions t
+            LEFT JOIN transaction_tags tt ON t.id = tt.transaction_id
+            LEFT JOIN tags tg ON tt.tag_id = tg.id
+            LEFT JOIN uploaded_files f ON t.file_sha_256 = f.sha_256
+            WHERE 1=1
+            """
 
-        # Add search condition if search_text is provided
-        if search_text:
-            query += f" AND {column_map[search_text_on]} LIKE '%{search_text}%'"
+            # Add search condition if search_text is provided
+            if search_text:
+                query += f" AND {column_map[search_text_on]} LIKE '%{search_text}%'"
 
-        query += f"""
-        GROUP BY t.id
-        ORDER BY {column_map[sort_column]} {'ASC' if ascending else 'DESC'}
-        """
+            query += f"""
+            GROUP BY t.id
+            ORDER BY {column_map[sort_column]} {'ASC' if ascending else 'DESC'}
+            """
 
-        df = pd.read_sql_query(query, conn)
+            df = pd.read_sql_query(query, conn)
 
-        # Convert date strings to datetime
-        df['date'] = pd.to_datetime(df['date'])
+            # Convert date strings to datetime
+            df['date'] = pd.to_datetime(df['date'])
 
-        # Rename columns to match expected format
-        df = df.rename(columns={
-            'date': 'Date',
-            'description': 'Description',
-            'amount': 'Amount',
-            'notes': 'Notes',
-            'tags': 'Tags',
-            'file_sha_256': 'File SHA-256',
-            'source_file': 'Source File'
-        })
-
-        return df
-    finally:
-        close_thread_connection()
+            # Rename columns to match expected format
+            df = df.rename(columns={
+                'date': 'Date',
+                'description': 'Description',
+                'amount': 'Amount',
+                'notes': 'Notes',
+                'tags': 'Tags',
+                'file_sha_256': 'File SHA-256',
+                'source_file': 'Source File'
+            })
+            _update_cache(cache_key, df)
+            return df
+        finally:
+            close_thread_connection()
+    cached_data = _get_cache(cache_key)
+    return cached_data if cached_data is not None else pd.DataFrame()
 
 def delete_transactions(transaction_ids):
     """Delete multiple transactions by their IDs.
@@ -486,6 +557,7 @@ def delete_transactions(transaction_ids):
         c.executemany('DELETE FROM transactions WHERE id = ?',
                      [(id,) for id in transaction_ids])
         conn.commit()
+        _invalidate_cache('transactions')
         return True
     except Exception as e:
         print(f"Error deleting transactions: {e}")
