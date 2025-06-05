@@ -363,7 +363,7 @@ def update_data(contents_list, filename_list, format_type, custom_date_col, cust
      Output('transaction-table', 'children', allow_duplicate=True)],
     Input('tabs', 'active_tab'),
     State('sort-state', 'data'),
-    prevent_initial_call=True,
+    prevent_initial_call='initial_duplicate',
     suppress_callback_exceptions=True
 )
 def load_initial_data(active_tab, sort_state):
