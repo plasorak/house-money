@@ -423,13 +423,17 @@ def update_transaction_table(start_date, end_date):
 
 @callback(
     Output("tags-table-container", "children"),
-    Input("add-tag-btn", "n_clicks"),
-    Input("tag-form-submit", "n_clicks"),
-    Input("tag-delete", "n_clicks"),
-    prevent_initial_call=True,
+    # [Input("add-tag-btn", "n_clicks"),
+    #  Input("tag-form-submit", "n_clicks"),
+    #  Input("tag-delete", "n_clicks"),
+    Input("tabs", "active_tab"),
+    prevent_initial_call='initial_duplicate',
     suppress_callback_exceptions=True,
 )
-def update_tags_table(n_add, n_submit, n_delete):
+def update_tags_table(active_tab):
+    if active_tab != "tags":
+        raise PreventUpdate
+
     df = get_tags()
 
     if df.empty:
