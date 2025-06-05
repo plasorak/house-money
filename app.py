@@ -642,7 +642,7 @@ def create_transaction_table(df):
             ], id="sort-amount", style={"cursor": "pointer"}),
             html.Th("Tags"),
             html.Th("Notes"),
-            html.Th("Source File")
+            html.Th("Data Source")
         ]))
     ]
 
