@@ -16,7 +16,7 @@ from database import (
     init_db, get_tags, add_tag, update_tag, delete_tag,
     save_file_info, get_uploaded_files, save_transactions, load_transactions,
     update_transaction_note, update_transaction_tags, get_tag_name_to_id_mapping,
-    create_manual_transaction, load_transactions_with_sort, DB_PATH,
+    create_manual_transaction, DB_PATH,
     close_thread_connection, delete_transactions
 )
 from file_import import process_uploaded_files
@@ -221,8 +221,8 @@ app.layout = dbc.Container([
 
     # Store components for the data
     dcc.Store(id='stored-data', data=load_transactions().to_dict('records')),
-    dcc.Store(id='sort-state', data={'column': 'date', 'ascending': True}),
-    dcc.Store(id='filter-state', data={'text': '', 'column': 'description'}),
+    dcc.Store(id='sort-state', data={'column': 'Date', 'ascending': True}),
+    dcc.Store(id='filter-state', data={'text': '', 'column': 'Description'}),
     dcc.Store(id='selected-transactions', data=[]),  # Store selected transaction IDs
 
     # Add Transaction Modal
@@ -328,8 +328,11 @@ def update_data(contents_list, filename_list, format_type, custom_date_col, cust
     if not contents_list:
         # If no new data uploaded, load from database
         print("No new data uploaded, loading from database")
-        df = load_transactions_with_sort(sort_state['column'], sort_state['ascending'])
+        df = load_transactions()
         print(f"Loaded {len(df)} transactions from database")
+
+        # Apply sorting
+        df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
 
         # Always refresh the uploaded files table
         uploaded_files_table = create_uploaded_files_table()
@@ -353,7 +356,8 @@ def update_data(contents_list, filename_list, format_type, custom_date_col, cust
     uploaded_files_table = create_uploaded_files_table()
 
     # Load transactions for the table with current sort
-    df = load_transactions_with_sort(sort_state['column'], sort_state['ascending'])
+    df = load_transactions()
+    df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
 
     return df.to_dict('records'), html.Div(status_messages), uploaded_files_table, create_transaction_table(df)
 
@@ -370,7 +374,8 @@ def load_initial_data(active_tab, sort_state):
     if active_tab != 'transactions':
         raise PreventUpdate
 
-    df = load_transactions_with_sort(sort_state['column'], sort_state['ascending'])
+    df = load_transactions()
+    df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
     if df.empty:
         return None, html.Div("No transaction found")
 
@@ -550,7 +555,8 @@ def update_transaction_tags_callback(new_tag_ids, dropdown_id, sort_state):
     # Update the tags in the database
     if update_transaction_tags(transaction_id, new_tag_ids):
         # Reload and display the updated transactions with current sort
-        df = load_transactions_with_sort(sort_state['column'], sort_state['ascending'])
+        df = load_transactions()
+        df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
         return df.to_dict('records'), create_transaction_table(df)
 
     raise PreventUpdate
@@ -589,7 +595,8 @@ def update_transaction_note_callback(note_values, note_ids, sort_state):
     # Update the note in the database
     if update_transaction_note(transaction_id, new_note):
         # Reload and display the updated transactions with current sort
-        df = load_transactions_with_sort(sort_state['column'], sort_state['ascending'])
+        df = load_transactions()
+        df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
         return df.to_dict('records'), create_transaction_table(df)
 
     raise PreventUpdate
@@ -603,9 +610,7 @@ def create_transaction_table(df):
     tag_name_to_id = get_tag_name_to_id_mapping()
 
     # Get current sort state from the stored data
-    sort_state = {'column': 'date', 'ascending': True}  # Default sort state
-    if hasattr(df, 'attrs') and 'sort_state' in df.attrs:
-        sort_state = df.attrs['sort_state']
+    sort_state = {'column': 'Date', 'ascending': True}  # Default sort state
 
     # Helper function to create sort indicator
     def get_sort_indicator(column):
@@ -713,7 +718,8 @@ def update_selected_transactions(checkbox_values, checkbox_ids, sort_state):
     selected_ids = [id for value_list in checkbox_values for id in value_list]
 
     # Load and display transactions with current sort
-    df = load_transactions_with_sort(sort_state['column'], sort_state['ascending'])
+    df = load_transactions()
+    df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
 
     return df.to_dict('records'), create_transaction_table(df), selected_ids
 
@@ -741,12 +747,14 @@ def filter_transactions(search_text, sort_state):
     filter_state = {'text': search_text or '', 'column': 'description'}
 
     # Load data with current sort and search
-    df = load_transactions_with_sort(
-        sort_column=sort_state['column'],
-        ascending=sort_state['ascending'],
-        search_text=search_text,
-        search_text_on='description'
-    )
+    df = load_transactions()
+
+    # Apply search filter if text is provided
+    if search_text:
+        df = df[df['Description'].str.contains(search_text, case=False, na=False)]
+
+    # Apply sorting
+    df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
 
     return df.to_dict('records'), create_transaction_table(df), filter_state
 
@@ -772,9 +780,9 @@ def sort_table(n_date, n_desc, n_amount, current_sort, filter_state):
 
     # Map column names to their database counterparts
     column_map = {
-        'sort-date': 'date',
-        'sort-description': 'description',
-        'sort-amount': 'amount'
+        'sort-date': 'Date',
+        'sort-description': 'Description',
+        'sort-amount': 'Amount'
     }
 
     # Get the column to sort by
@@ -791,13 +799,15 @@ def sort_table(n_date, n_desc, n_amount, current_sort, filter_state):
     # Update sort state
     sort_state = {'column': sort_column, 'ascending': ascending}
 
-    # Load data with current sort and any active filters
-    df = load_transactions_with_sort(
-        sort_column=sort_column,
-        ascending=ascending,
-        search_text=filter_state['text'],
-        search_text_on=filter_state['column']
-    )
+    # Load data and apply filters and sorting
+    df = load_transactions()
+
+    # Apply search filter if text is provided
+    if filter_state['text']:
+        df = df[df[filter_state['column']].str.contains(filter_state['text'], case=False, na=False)]
+
+    # Apply sorting
+    df = df.sort_values(by=sort_column, ascending=ascending)
 
     return df.to_dict('records'), create_transaction_table(df), sort_state
 
