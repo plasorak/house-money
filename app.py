@@ -752,7 +752,8 @@ def filter_transactions(search_text, sort_state):
 
 @callback(
     [Output('stored-data', 'data', allow_duplicate=True),
-     Output('transaction-table', 'children', allow_duplicate=True)],
+     Output('transaction-table', 'children', allow_duplicate=True),
+     Output('sort-state', 'data', allow_duplicate=True)],
     [Input('sort-date', 'n_clicks'),
      Input('sort-description', 'n_clicks'),
      Input('sort-amount', 'n_clicks')],
@@ -764,7 +765,7 @@ def filter_transactions(search_text, sort_state):
 def sort_table(n_date, n_desc, n_amount, current_sort, filter_state):
     ctx = dash.callback_context
     if not ctx.triggered:
-        return dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update
 
     # Get the triggered input
     triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
@@ -779,7 +780,7 @@ def sort_table(n_date, n_desc, n_amount, current_sort, filter_state):
     # Get the column to sort by
     sort_column = column_map.get(triggered_id)
     if not sort_column:
-        return dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update
 
     # If clicking the same column, toggle direction
     # Otherwise, sort ascending by default
@@ -798,7 +799,7 @@ def sort_table(n_date, n_desc, n_amount, current_sort, filter_state):
         search_text_on=filter_state['column']
     )
 
-    return df.to_dict('records'), create_transaction_table(df)
+    return df.to_dict('records'), create_transaction_table(df), sort_state
 
 @callback(
     Output("add-transaction-modal", "is_open"),
