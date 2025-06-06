@@ -3,26 +3,38 @@ from dash import html, dcc, callback, Input, Output, State
 from dash.exceptions import PreventUpdate
 import dash_bootstrap_components as dbc
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
-import base64
-import io
-import sqlite3
-import hashlib
+import json
 import atexit
+import functools
+import logging
 from database import (
-    init_db, get_tags, add_tag, update_tag, delete_tag,
-    save_file_info, get_uploaded_files, save_transactions, load_transactions,
+    get_tags, add_tag, get_uploaded_files, load_transactions,
     update_transaction_note, update_transaction_tags, get_tag_name_to_id_mapping,
-    create_manual_transaction, DB_PATH,
-    close_thread_connection, delete_transactions
+    close_thread_connection
 )
 from file_import import process_uploaded_files
 
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
 # Register cleanup function for the main thread
 atexit.register(close_thread_connection)
+
+def debug_callback(func):
+    """Simple decorator to log callback name when executed."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        logger.debug(f"Callback executed: {func.__name__}")
+        return func(*args, **kwargs)
+    return wrapper
 
 # Add cleanup for each callback
 def cleanup_after_callback(func):
@@ -46,83 +58,6 @@ app = dash.Dash(
 )
 app.title = "House Money"
 
-def calculate_file_hash(contents):
-    """Calculate SHA-256 hash of file contents."""
-    content_type, content_string = contents.split(',')
-    decoded = base64.b64decode(content_string)
-    return hashlib.sha256(decoded).hexdigest()
-
-def parse_contents(contents, filename, format_type='standard', custom_columns=None):
-    print(f"Parsing contents for {filename} with format {format_type}")
-    content_type, content_string = contents.split(',')
-    decoded = base64.b64decode(content_string)
-
-    try:
-        df = pd.read_csv(io.StringIO(decoded.decode('utf-8')))
-        print(f"Successfully read CSV with columns: {df.columns.tolist()}")
-
-        # Define column mappings for different formats
-        format_mappings = {
-            'standard': {
-                'date': 'Date',
-                'description': 'Description',
-                'amount': 'Amount'
-            },
-            'bank': {
-                'date': 'Transaction Date',
-                'description': 'Details',
-                'amount': 'Transaction Amount'
-            },
-            'custom': custom_columns or {
-                'date': 'Date',
-                'description': 'Description',
-                'amount': 'Amount'
-            }
-        }
-
-        # Get the appropriate column mapping
-        mapping = format_mappings[format_type]
-        print(f"Using column mapping: {mapping}")
-
-        # Check if required columns exist in the CSV
-        if not all(col in df.columns for col in mapping.values()):
-            missing_cols = [col for col in mapping.values() if col not in df.columns]
-            print(f"Missing required columns: {missing_cols}")
-            return None, f"CSV is missing required columns: {', '.join(missing_cols)}"
-
-        # Rename columns to standard format
-        df = df.rename(columns={
-            mapping['date']: 'Date',
-            mapping['description']: 'Description',
-            mapping['amount']: 'Amount'
-        })
-        print("Columns renamed successfully")
-
-        # Convert date column to datetime
-        df['Date'] = pd.to_datetime(df['Date'])
-        print("Date column converted to datetime")
-
-        # Add Tags column if it doesn't exist
-        if 'Tags' not in df.columns:
-            df['Tags'] = ''
-            print("Added empty Tags column")
-
-        # Ensure Amount is numeric
-        df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce')
-        print("Amount column converted to numeric")
-
-        # Remove any rows with invalid amounts
-        original_len = len(df)
-        df = df.dropna(subset=['Amount'])
-        if len(df) < original_len:
-            print(f"Removed {original_len - len(df)} rows with invalid amounts")
-
-        print(f"Successfully parsed {len(df)} transactions")
-        return df, None
-    except Exception as e:
-        print(f"Error in parse_contents: {str(e)}")
-        return None, f"Error processing {filename}: {str(e)}"
-
 # Layout
 app.layout = dbc.Container([
     dbc.Row([
@@ -140,6 +75,14 @@ app.layout = dbc.Container([
                     dbc.Row([
                         dbc.Col([
                             html.H4("Transactions", className="mt-4"),
+                            dcc.Graph(id='transaction-count-plot'),
+                            dcc.DatePickerRange(
+                                id='date-range',
+                                start_date=datetime.now() - relativedelta(months=1),
+                                end_date=datetime.now(),
+                                display_format='YYYY-MM-DD',
+                                className="mb-3"
+                            ),
                             dbc.Button("Add Transaction", id="add-transaction-btn", color="primary", className="mb-3"),
                             html.Div(id='transaction-table')
                         ])
@@ -220,10 +163,10 @@ app.layout = dbc.Container([
     ]),
 
     # Store components for the data
-    dcc.Store(id='stored-data', data=load_transactions().to_dict('records')),
+    dcc.Store(id='transactions-data', data=load_transactions().to_dict('records')),
     dcc.Store(id='sort-state', data={'column': 'Date', 'ascending': True}),
-    dcc.Store(id='filter-state', data={'text': '', 'column': 'Description'}),
-    dcc.Store(id='selected-transactions', data=[]),  # Store selected transaction IDs
+    dcc.Store(id='filter-state', data=[]),
+    dcc.Store(id='date-range-state', data={'start_date': None, 'end_date': None}),  # Store date range state
 
     # Add Transaction Modal
     dbc.Modal([
@@ -302,13 +245,14 @@ app.layout = dbc.Container([
     Output('custom-format-inputs', 'style'),
     Input('csv-format', 'value')
 )
+@debug_callback
 def toggle_custom_format(format_type):
     if format_type == 'custom':
         return {'display': 'block'}
     return {'display': 'none'}
 
 @callback(
-    [Output('stored-data', 'data', allow_duplicate=True),
+    [Output('transactions-data', 'data', allow_duplicate=True),
      Output('upload-status', 'children'),
      Output('uploaded-files-table', 'children'),
      Output('transaction-table', 'children', allow_duplicate=True)],
@@ -318,13 +262,15 @@ def toggle_custom_format(format_type):
      State('date-column', 'value'),
      State('description-column', 'value'),
      State('amount-column', 'value'),
-     State('sort-state', 'data')],
+     State('sort-state', 'data'),
+     State('filter-state', 'data'),
+     State('date-range-state', 'data')],
     prevent_initial_call=True,
     suppress_callback_exceptions=True
 )
+@debug_callback
 @cleanup_after_callback
-def update_data(contents_list, filename_list, format_type, custom_date_col, custom_desc_col, custom_amount_col, sort_state):
-    print(f"update_data called with {len(contents_list) if contents_list else 0} files")
+def update_data(contents_list, filename_list, format_type, custom_date_col, custom_desc_col, custom_amount_col, sort_state, filter_state, date_range_state):
     if not contents_list:
         # If no new data uploaded, load from database
         print("No new data uploaded, loading from database")
@@ -340,7 +286,7 @@ def update_data(contents_list, filename_list, format_type, custom_date_col, cust
         if df.empty:
             return None, "", uploaded_files_table, html.Div("No transaction found")
 
-        return df.to_dict('records'), "", uploaded_files_table, create_transaction_table(df)
+        return df.to_dict('records'), "", uploaded_files_table, create_transaction_table(df, sort_state, filter_state, date_range_state)
 
     # Process uploaded files using the new module
     data, tags, status_messages = process_uploaded_files(
@@ -359,27 +305,42 @@ def update_data(contents_list, filename_list, format_type, custom_date_col, cust
     df = load_transactions()
     df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
 
-    return df.to_dict('records'), html.Div(status_messages), uploaded_files_table, create_transaction_table(df)
+    return df.to_dict('records'), html.Div(status_messages), uploaded_files_table, create_transaction_table(df, sort_state, filter_state, date_range_state)
 
 # Add a separate callback for initial data loading
 @callback(
-    [Output('stored-data', 'data', allow_duplicate=True),
+    [Output('transactions-data', 'data', allow_duplicate=True),
      Output('transaction-table', 'children', allow_duplicate=True)],
-    Input('tabs', 'active_tab'),
-    State('sort-state', 'data'),
+    [Input('tabs', 'active_tab'),
+     Input('sort-state', 'data'),
+     Input('filter-state', 'data'),
+     Input('date-range-state', 'data')],
     prevent_initial_call='initial_duplicate',
     suppress_callback_exceptions=True
 )
-def load_initial_data(active_tab, sort_state):
+@debug_callback
+def load_initial_data(active_tab, sort_state, filter_state, date_range_state):
     if active_tab != 'transactions':
         raise PreventUpdate
 
     df = load_transactions()
+
+    # Apply date range filter if it exists
+    if date_range_state and (date_range_state['start_date'] or date_range_state['end_date']):
+        start_date = pd.to_datetime(date_range_state['start_date']) if date_range_state['start_date'] else None
+        end_date = pd.to_datetime(date_range_state['end_date']) if date_range_state['end_date'] else None
+
+        if start_date:
+            df = df[df['Date'] >= start_date]
+        if end_date:
+            df = df[df['Date'] <= end_date]
+
     df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
+
     if df.empty:
         return None, html.Div("No transaction found")
 
-    return df.to_dict('records'), create_transaction_table(df)
+    return df.to_dict('records'), create_transaction_table(df, sort_state, filter_state, date_range_state)
 
 def create_uploaded_files_table():
     """Create a table showing uploaded files."""
@@ -408,33 +369,45 @@ def create_uploaded_files_table():
     ])
 
 @callback(
-    Output('transaction-table', 'children', allow_duplicate=True),
+    [Output('transactions-data', 'data', allow_duplicate=True),
+     Output('transaction-table', 'children', allow_duplicate=True)],
     [Input('date-range', 'start_date'),
-     Input('date-range', 'end_date')],
+     Input('date-range', 'end_date'),
+     Input('sort-state', 'data'),
+     Input('filter-state', 'data')],
+    [State('date-range-state', 'data')],
     prevent_initial_call=True
 )
-def update_transaction_table(start_date, end_date):
+@debug_callback
+def update_transaction_table(start_date, end_date, sort_state, filter_state, date_range_state):
     # Load transactions directly from database
     df = load_transactions()
     print(f"Loaded {len(df)} transactions from database")
     if df.empty:
-        return html.Div("No transaction found")
+        return None, html.Div("No transaction found")
 
-    # Apply filters
-    mask = (df['Date'] >= start_date) & (df['Date'] <= end_date)
-    df = df[mask]
+    # Convert dates to datetime
+    start_date = pd.to_datetime(start_date) if start_date else None
+    end_date = pd.to_datetime(end_date) if end_date else None
 
-    return create_transaction_table(df)
+    # Apply date filters if dates are provided
+    if start_date:
+        df = df[df['Date'] >= start_date]
+    if end_date:
+        df = df[df['Date'] <= end_date]
+
+    # Apply sorting
+    df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
+
+    return df.to_dict('records'), create_transaction_table(df, sort_state, filter_state, date_range_state)
 
 @callback(
     Output("tags-table-container", "children"),
-    # [Input("add-tag-btn", "n_clicks"),
-    #  Input("tag-form-submit", "n_clicks"),
-    #  Input("tag-delete", "n_clicks"),
     Input("tabs", "active_tab"),
     prevent_initial_call='initial_duplicate',
     suppress_callback_exceptions=True,
 )
+@debug_callback
 def update_tags_table(active_tab):
     if active_tab != "tags":
         raise PreventUpdate
@@ -487,6 +460,7 @@ def update_tags_table(active_tab):
     prevent_initial_call=True,
     suppress_callback_exceptions=True
 )
+@debug_callback
 def show_tag_form(n_clicks):
     if n_clicks is None:
         return None
@@ -508,6 +482,7 @@ def show_tag_form(n_clicks):
     prevent_initial_call=True,
     suppress_callback_exceptions=True
 )
+@debug_callback
 def hide_tag_form(n_clicks):
     if n_clicks is None:
         raise PreventUpdate
@@ -522,6 +497,7 @@ def hide_tag_form(n_clicks):
     prevent_initial_call=True,
     suppress_callback_exceptions=True
 )
+@debug_callback
 def submit_tag_form(n_clicks, name, description, color):
     if n_clicks is None:
         raise PreventUpdate
@@ -536,41 +512,66 @@ def submit_tag_form(n_clicks, name, description, color):
         return html.Div("Tag name already exists", style={"color": "red"})
 
 @callback(
-    [Output('stored-data', 'data', allow_duplicate=True),
+    [Output('transactions-data', 'data', allow_duplicate=True),
      Output('transaction-table', 'children', allow_duplicate=True)],
-    [Input('tag-filter', 'value')],
-    [State('tag-filter', 'id'),
-     State('sort-state', 'data')],
+    [Input({'type': 'tag-filter', 'index': dash.ALL}, 'value'),
+     Input('sort-state', 'data'),
+     Input('filter-state', 'data'),
+     Input('date-range-state', 'data')],
+    [State({'type': 'tag-filter', 'index': dash.ALL}, 'id')],
     prevent_initial_call=True,
     suppress_callback_exceptions=True
 )
-def update_transaction_tags_callback(new_tag_ids, dropdown_id, sort_state):
+@debug_callback
+def update_transaction_tags_callback(new_tag_ids, dropdown_ids, sort_state, filter_state, date_range_state):
     print("update_transaction_tags_callback")
-    if not dropdown_id or not new_tag_ids:
+    if not dropdown_ids or not new_tag_ids:
         raise PreventUpdate
 
-    # Extract transaction_id from the dropdown_id
-    transaction_id = int(dropdown_id['index'])
+    # Find which input triggered the callback
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        raise PreventUpdate
+
+    triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    if not triggered_id:
+        raise PreventUpdate
+
+    # Parse the triggered ID to get the transaction ID
+    triggered_id = json.loads(triggered_id)
+    transaction_id = triggered_id['index']
+
+    # Get the new tag values
+    # Find the index of the dropdown that matches the transaction ID
+    for i, id_dict in enumerate(dropdown_ids):
+        if isinstance(id_dict, dict) and id_dict.get('index') == transaction_id:
+            new_tags = new_tag_ids[i]
+            break
+    else:
+        raise PreventUpdate
 
     # Update the tags in the database
-    if update_transaction_tags(transaction_id, new_tag_ids):
+    if update_transaction_tags(transaction_id, new_tags):
         # Reload and display the updated transactions with current sort
         df = load_transactions()
         df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
-        return df.to_dict('records'), create_transaction_table(df)
+        return df.to_dict('records'), create_transaction_table(df, sort_state, filter_state, date_range_state)
 
     raise PreventUpdate
 
 @callback(
-    [Output('stored-data', 'data', allow_duplicate=True),
+    [Output('transactions-data', 'data', allow_duplicate=True),
      Output('transaction-table', 'children', allow_duplicate=True)],
-    [Input({'type': 'note-input', 'index': dash.ALL}, 'value')],
-    [State({'type': 'note-input', 'index': dash.ALL}, 'id'),
-     State('sort-state', 'data')],
+    [Input({'type': 'note-input', 'index': dash.ALL}, 'value'),
+     Input('sort-state', 'data'),
+     Input('filter-state', 'data'),
+     Input('date-range-state', 'data')],
+    [State({'type': 'note-input', 'index': dash.ALL}, 'id')],
     prevent_initial_call=True,
     suppress_callback_exceptions=True
 )
-def update_transaction_note_callback(note_values, note_ids, sort_state):
+@debug_callback
+def update_transaction_note_callback(note_values, note_ids, sort_state, filter_state, date_range_state):
     if not note_ids:
         raise PreventUpdate
 
@@ -584,33 +585,33 @@ def update_transaction_note_callback(note_values, note_ids, sort_state):
         raise PreventUpdate
 
     # Parse the triggered ID to get the transaction ID
-    import json
     triggered_id = json.loads(triggered_id)
     transaction_id = triggered_id['index']
 
     # Get the new note value
-    note_index = next(i for i, id_dict in enumerate(note_ids) if id_dict['index'] == transaction_id)
-    new_note = note_values[note_index]
+    for i, id_dict in enumerate(note_ids):
+        if isinstance(id_dict, dict) and id_dict.get('index') == transaction_id:
+            new_note = note_values[i]
+            break
+    else:
+        raise PreventUpdate
 
     # Update the note in the database
     if update_transaction_note(transaction_id, new_note):
         # Reload and display the updated transactions with current sort
         df = load_transactions()
         df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
-        return df.to_dict('records'), create_transaction_table(df)
+        return df.to_dict('records'), create_transaction_table(df, sort_state, filter_state, date_range_state)
 
     raise PreventUpdate
 
-def create_transaction_table(df):
+def create_transaction_table(df, sort_state, filter_state, date_range_state):
     """Create an interactive transaction table with tag dropdowns."""
     if df.empty:
         return html.Div("No transaction found")
 
     # Get tag name to ID mapping
     tag_name_to_id = get_tag_name_to_id_mapping()
-
-    # Get current sort state from the stored data
-    sort_state = {'column': 'Date', 'ascending': True}  # Default sort state
 
     # Helper function to create sort indicator
     def get_sort_indicator(column):
@@ -704,45 +705,18 @@ def create_transaction_table(df):
     ])
 
 @callback(
-    [Output('stored-data', 'data', allow_duplicate=True),
-     Output('transaction-table', 'children', allow_duplicate=True),
-     Output('selected-transactions', 'data', allow_duplicate=True)],
-    [Input({'type': 'transaction-checkbox', 'index': dash.ALL}, 'value')],
-    [State({'type': 'transaction-checkbox', 'index': dash.ALL}, 'id'),
-     State('sort-state', 'data')],
-    prevent_initial_call=True,
-    suppress_callback_exceptions=True
-)
-def update_selected_transactions(checkbox_values, checkbox_ids, sort_state):
-    # Flatten the list of selected transaction IDs
-    selected_ids = [id for value_list in checkbox_values for id in value_list]
-
-    # Load and display transactions with current sort
-    df = load_transactions()
-    df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
-
-    return df.to_dict('records'), create_transaction_table(df), selected_ids
-
-@callback(
-    Output("delete-selected-btn", "style"),
-    Input("selected-transactions", "data"),
-    prevent_initial_call=True
-)
-def toggle_delete_button(selected_ids):
-    if selected_ids:
-        return {'display': 'block'}
-    return {'display': 'none'}
-
-@callback(
-    [Output('stored-data', 'data', allow_duplicate=True),
+    [Output('transactions-data', 'data', allow_duplicate=True),
      Output('transaction-table', 'children', allow_duplicate=True),
      Output('filter-state', 'data', allow_duplicate=True)],
-    Input('description-filter', 'value'),
-    State('sort-state', 'data'),
+    [Input('description-filter', 'value'),
+     Input('sort-state', 'data'),
+     Input('date-range-state', 'data')],
+    [State('filter-state', 'data')],
     prevent_initial_call=True,
     suppress_callback_exceptions=True
 )
-def filter_transactions(search_text, sort_state):
+@debug_callback
+def filter_transactions(search_text, sort_state, date_range_state, filter_state):
     # Update filter state
     filter_state = {'text': search_text or '', 'column': 'description'}
 
@@ -756,21 +730,23 @@ def filter_transactions(search_text, sort_state):
     # Apply sorting
     df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
 
-    return df.to_dict('records'), create_transaction_table(df), filter_state
+    return df.to_dict('records'), create_transaction_table(df, sort_state, filter_state, date_range_state), filter_state
 
 @callback(
-    [Output('stored-data', 'data', allow_duplicate=True),
+    [Output('transactions-data', 'data', allow_duplicate=True),
      Output('transaction-table', 'children', allow_duplicate=True),
      Output('sort-state', 'data', allow_duplicate=True)],
     [Input('sort-date', 'n_clicks'),
      Input('sort-description', 'n_clicks'),
-     Input('sort-amount', 'n_clicks')],
-    [State('sort-state', 'data'),
-     State('filter-state', 'data')],
+     Input('sort-amount', 'n_clicks'),
+     Input('filter-state', 'data'),
+     Input('date-range-state', 'data')],
+    [State('sort-state', 'data')],
     prevent_initial_call=True,
     suppress_callback_exceptions=True
 )
-def sort_table(n_date, n_desc, n_amount, current_sort, filter_state):
+@debug_callback
+def sort_table(n_date, n_desc, n_amount, current_sort, filter_state, date_range_state):
     ctx = dash.callback_context
     if not ctx.triggered:
         return dash.no_update, dash.no_update, dash.no_update
@@ -802,14 +778,14 @@ def sort_table(n_date, n_desc, n_amount, current_sort, filter_state):
     # Load data and apply filters and sorting
     df = load_transactions()
 
-    # Apply search filter if text is provided
-    if filter_state['text']:
+    # Apply search filter if text is provided and filter_state exists
+    if filter_state and isinstance(filter_state, dict) and filter_state.get('text'):
         df = df[df[filter_state['column']].str.contains(filter_state['text'], case=False, na=False)]
 
     # Apply sorting
     df = df.sort_values(by=sort_column, ascending=ascending)
 
-    return df.to_dict('records'), create_transaction_table(df), sort_state
+    return df.to_dict('records'), create_transaction_table(df, sort_state, filter_state, date_range_state), sort_state
 
 @callback(
     Output("add-transaction-modal", "is_open"),
@@ -819,6 +795,7 @@ def sort_table(n_date, n_desc, n_amount, current_sort, filter_state):
     [State("add-transaction-modal", "is_open")],
     prevent_initial_call=True
 )
+@debug_callback
 def toggle_transaction_modal(n_add, n_cancel, n_submit, is_open):
     ctx = dash.callback_context
     if not ctx.triggered:
@@ -828,6 +805,44 @@ def toggle_transaction_modal(n_add, n_cancel, n_submit, is_open):
     if button_id in ["add-transaction-btn", "cancel-transaction"]:
         return not is_open
     return is_open
+
+@callback(
+    Output('transaction-count-plot', 'figure'),
+    Input('transactions-data', 'data'),
+    prevent_initial_call=True
+)
+@debug_callback
+def update_transaction_count_plot(data):
+    if not data:
+        return go.Figure()
+
+    # Convert data to DataFrame
+    df = pd.DataFrame(data)
+    df['Date'] = pd.to_datetime(df['Date'])
+
+    # Group by date and count transactions
+    daily_counts = df.groupby(df['Date'].dt.date).size().reset_index(name='count')
+    daily_counts['Date'] = pd.to_datetime(daily_counts['Date'])
+
+    # Create the figure
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=daily_counts['Date'],
+        y=daily_counts['count'],
+        name='Transactions per Day'
+    ))
+
+    # Update layout
+    fig.update_layout(
+        title='Transactions / Day',
+        xaxis_title='Date',
+        yaxis_title='Transactions',
+        showlegend=False,
+        height=300,
+        margin=dict(l=20, r=20, t=40, b=20)
+    )
+
+    return fig
 
 if __name__ == '__main__':
     app.run(debug=True)
