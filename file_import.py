@@ -1,7 +1,7 @@
 import base64
 import hashlib
 import io
-import pandas as pd
+import polars as pl
 import sqlite3
 from database import DB_PATH, save_file_info, save_transactions
 
@@ -17,8 +17,8 @@ def parse_contents(contents, filename, format_type='standard', custom_columns=No
     decoded = base64.b64decode(content_string)
 
     try:
-        df = pd.read_csv(io.StringIO(decoded.decode('utf-8')))
-        print(f"Successfully read CSV with columns: {df.columns.tolist()}")
+        df = pl.read_csv(io.StringIO(decoded.decode('utf-8')))
+        print(f"Successfully read CSV with columns: {df.columns}")
 
         # Define column mappings for different formats
         format_mappings = {
@@ -50,7 +50,7 @@ def parse_contents(contents, filename, format_type='standard', custom_columns=No
             return None, f"CSV is missing required columns: {', '.join(missing_cols)}"
 
         # Rename columns to standard format
-        df = df.rename(columns={
+        df = df.rename({
             mapping['date']: 'Date',
             mapping['description']: 'Description',
             mapping['amount']: 'Amount'
@@ -58,21 +58,21 @@ def parse_contents(contents, filename, format_type='standard', custom_columns=No
         print("Columns renamed successfully")
 
         # Convert date column to datetime
-        df['Date'] = pd.to_datetime(df['Date'])
+        df = df.with_columns(pl.col('Date').cast(pl.Datetime))
         print("Date column converted to datetime")
 
         # Add Tags column if it doesn't exist
         if 'Tags' not in df.columns:
-            df['Tags'] = ''
+            df = df.with_columns(pl.lit('').alias('Tags'))
             print("Added empty Tags column")
 
         # Ensure Amount is numeric
-        df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce')
+        df = df.with_columns(pl.col('Amount').cast(pl.Decimal))
         print("Amount column converted to numeric")
 
         # Remove any rows with invalid amounts
         original_len = len(df)
-        df = df.dropna(subset=['Amount'])
+        df = df.filter(pl.col('Amount').is_not_null())
         if len(df) < original_len:
             print(f"Removed {original_len - len(df)} rows with invalid amounts")
 
@@ -140,17 +140,17 @@ def process_uploaded_files(contents_list, filename_list, format_type, custom_dat
         save_transactions(df, sha_256)
 
     # Combine all dataframes for display
-    combined_df = pd.concat([df for df, _ in dfs], ignore_index=True)
+    combined_df = pl.concat([df for df, _ in dfs])
     print(f"Combined dataframe has {len(combined_df)} transactions")
 
     # Sort by date
-    combined_df = combined_df.sort_values('Date', ascending=False)
+    combined_df = combined_df.sort('Date', descending=True)
 
     # Convert date to string format for JSON serialization
-    combined_df['Date'] = combined_df['Date'].dt.strftime('%Y-%m-%d')
+    combined_df = combined_df.with_columns(pl.col('Date').dt.strftime('%Y-%m-%d'))
 
     # Get unique tags
     tags = [{'label': tag, 'value': tag} for tag in combined_df['Tags'].str.split(',').explode().unique() if tag]
     print(f"Found {len(tags)} unique tags")
 
-    return combined_df.to_dict('records'), tags, status_messages
+    return combined_df.to_dicts(), tags, status_messages

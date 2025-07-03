@@ -2,7 +2,7 @@ import dash
 from dash import html, dcc, callback, Input, Output, State
 from dash.exceptions import PreventUpdate
 import dash_bootstrap_components as dbc
-import pandas as pd
+import polars as pl
 import plotly.graph_objects as go
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
@@ -163,7 +163,7 @@ app.layout = dbc.Container([
     ]),
 
     # Store components for the data
-    dcc.Store(id='transactions-data', data=load_transactions().to_dict('records')),
+    dcc.Store(id='transactions-data', data=load_transactions().to_dicts()),
     dcc.Store(id='sort-state', data={'column': 'Date', 'ascending': True}),
     dcc.Store(id='filter-state', data=[]),
     dcc.Store(id='date-range-state', data={'start_date': None, 'end_date': None}),  # Store date range state
@@ -278,15 +278,15 @@ def update_data(contents_list, filename_list, format_type, custom_date_col, cust
         print(f"Loaded {len(df)} transactions from database")
 
         # Apply sorting
-        df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
+        df = df.sort(sort_state['column'], descending=not sort_state['ascending'])
 
         # Always refresh the uploaded files table
         uploaded_files_table = create_uploaded_files_table()
 
-        if df.empty:
+        if df.is_empty():
             return None, "", uploaded_files_table, html.Div("No transaction found")
 
-        return df.to_dict('records'), "", uploaded_files_table, create_transaction_table(df, sort_state, filter_state, date_range_state)
+        return df.to_dicts(), "", uploaded_files_table, create_transaction_table(df, sort_state, filter_state, date_range_state)
 
     # Process uploaded files using the new module
     data, tags, status_messages = process_uploaded_files(
@@ -303,9 +303,9 @@ def update_data(contents_list, filename_list, format_type, custom_date_col, cust
 
     # Load transactions for the table with current sort
     df = load_transactions()
-    df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
+    df = df.sort(sort_state['column'], descending=not sort_state['ascending'])
 
-    return df.to_dict('records'), html.Div(status_messages), uploaded_files_table, create_transaction_table(df, sort_state, filter_state, date_range_state)
+    return df.to_dicts(), html.Div(status_messages), uploaded_files_table, create_transaction_table(df, sort_state, filter_state, date_range_state)
 
 # Add a separate callback for initial data loading
 @callback(
@@ -327,41 +327,40 @@ def load_initial_data(active_tab, sort_state, filter_state, date_range_state):
 
     # Apply date range filter if it exists
     if date_range_state and (date_range_state['start_date'] or date_range_state['end_date']):
-        start_date = pd.to_datetime(date_range_state['start_date']) if date_range_state['start_date'] else None
-        end_date = pd.to_datetime(date_range_state['end_date']) if date_range_state['end_date'] else None
+        start_date = pl.datetime(date_range_state['start_date']) if date_range_state['start_date'] else None
+        end_date = pl.datetime(date_range_state['end_date']) if date_range_state['end_date'] else None
 
         if start_date:
-            df = df[df['Date'] >= start_date]
+            df = df.filter(pl.col('Date') >= start_date)
         if end_date:
-            df = df[df['Date'] <= end_date]
+            df = df.filter(pl.col('Date') <= end_date)
 
-    df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
+    df = df.sort(sort_state['column'], descending=not sort_state['ascending'])
 
-    if df.empty:
+    if df.is_empty():
         return None, html.Div("No transaction found")
 
-    return df.to_dict('records'), create_transaction_table(df, sort_state, filter_state, date_range_state)
+    return df.to_dicts(), create_transaction_table(df, sort_state, filter_state, date_range_state)
 
 def create_uploaded_files_table():
     """Create a table showing uploaded files."""
     print("Creating uploaded files table...")
     df = get_uploaded_files()
     print(f"Got uploaded files from database: {len(df)} files")
-    print(f"Files: {df.to_dict('records') if not df.empty else 'No files'}")
+    print(f"Files: {df.to_dicts() if not df.is_empty() else 'No files'}")
 
-    if df.empty:
+    if df.is_empty():
         return html.Div("No files uploaded yet")
 
-    df['upload_date'] = pd.to_datetime(df['upload_date'])
-    df['upload_date'] = df['upload_date'].dt.strftime('%Y-%m-%d %H:%M:%S')
-
-    # Format the SHA-256 to be more readable (first 8 chars)
-    df['sha_256'] = df['sha_256'].apply(lambda x: f"{x[:8]}...")
+    df = df.with_columns([
+        pl.col('upload_date').cast(pl.Datetime).dt.strftime('%Y-%m-%d %H:%M:%S').alias('upload_date'),
+        pl.col('sha_256').str.slice(0, 8).str.concat('...').alias('sha_256')
+    ])
 
     return html.Div([
         html.H5("Uploaded Files", className="mt-4"),
         dbc.Table.from_dataframe(
-            df,
+            df.to_pandas(),  # Convert to pandas for dbc.Table compatibility
             striped=True,
             bordered=True,
             hover=True
@@ -383,23 +382,23 @@ def update_transaction_table(start_date, end_date, sort_state, filter_state, dat
     # Load transactions directly from database
     df = load_transactions()
     print(f"Loaded {len(df)} transactions from database")
-    if df.empty:
+    if df.is_empty():
         return None, html.Div("No transaction found")
 
     # Convert dates to datetime
-    start_date = pd.to_datetime(start_date) if start_date else None
-    end_date = pd.to_datetime(end_date) if end_date else None
+    start_date = pl.datetime(start_date) if start_date else None
+    end_date = pl.datetime(end_date) if end_date else None
 
     # Apply date filters if dates are provided
     if start_date:
-        df = df[df['Date'] >= start_date]
+        df = df.filter(pl.col('Date') >= start_date)
     if end_date:
-        df = df[df['Date'] <= end_date]
+        df = df.filter(pl.col('Date') <= end_date)
 
     # Apply sorting
-    df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
+    df = df.sort(sort_state['column'], descending=not sort_state['ascending'])
 
-    return df.to_dict('records'), create_transaction_table(df, sort_state, filter_state, date_range_state)
+    return df.to_dicts(), create_transaction_table(df, sort_state, filter_state, date_range_state)
 
 @callback(
     Output("tags-table-container", "children"),
@@ -414,7 +413,7 @@ def update_tags_table(active_tab):
 
     df = get_tags()
 
-    if df.empty:
+    if df.is_empty():
         return html.Div("No tags found")
 
     # Format the table with color swatches
@@ -428,7 +427,7 @@ def update_tags_table(active_tab):
     ]
 
     rows = []
-    for _, row in df.iterrows():
+    for _, row in df.iter_rows(named=True):
         color_swatch = html.Td(
             html.Div(
                 style={
@@ -444,7 +443,7 @@ def update_tags_table(active_tab):
             color_swatch,
             html.Td(row['name']),
             html.Td(row['description']),
-            html.Td(pd.to_datetime(row['created_at']).strftime('%Y-%m-%d %H:%M'))
+            html.Td(row['created_at'].strftime('%Y-%m-%d %H:%M'))
         ]))
 
     table_body = [html.Tbody(rows)]
@@ -554,8 +553,8 @@ def update_transaction_tags_callback(new_tag_ids, dropdown_ids, sort_state, filt
     if update_transaction_tags(transaction_id, new_tags):
         # Reload and display the updated transactions with current sort
         df = load_transactions()
-        df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
-        return df.to_dict('records'), create_transaction_table(df, sort_state, filter_state, date_range_state)
+        df = df.sort(sort_state['column'], descending=not sort_state['ascending'])
+        return df.to_dicts(), create_transaction_table(df, sort_state, filter_state, date_range_state)
 
     raise PreventUpdate
 
@@ -600,14 +599,14 @@ def update_transaction_note_callback(note_values, note_ids, sort_state, filter_s
     if update_transaction_note(transaction_id, new_note):
         # Reload and display the updated transactions with current sort
         df = load_transactions()
-        df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
-        return df.to_dict('records'), create_transaction_table(df, sort_state, filter_state, date_range_state)
+        df = df.sort(sort_state['column'], descending=not sort_state['ascending'])
+        return df.to_dicts(), create_transaction_table(df, sort_state, filter_state, date_range_state)
 
     raise PreventUpdate
 
 def create_transaction_table(df, sort_state, filter_state, date_range_state):
     """Create an interactive transaction table with tag dropdowns."""
-    if df.empty:
+    if df.is_empty():
         return html.Div("No transaction found")
 
     # Get tag name to ID mapping
@@ -654,7 +653,7 @@ def create_transaction_table(df, sort_state, filter_state, date_range_state):
 
     # Create table rows with tag dropdowns
     rows = []
-    for _, row in df.iterrows():
+    for row in df.iter_rows(named=True):
         # Get current tags for this transaction
         current_tags = [tag.strip() for tag in str(row['Tags']).split(',') if tag.strip()]
         # Convert tag names to IDs
@@ -725,12 +724,12 @@ def filter_transactions(search_text, sort_state, date_range_state, filter_state)
 
     # Apply search filter if text is provided
     if search_text:
-        df = df[df['Description'].str.contains(search_text, case=False, na=False)]
+        df = df.filter(pl.col('Description').str.contains(search_text, literal=True))
 
     # Apply sorting
-    df = df.sort_values(by=sort_state['column'], ascending=sort_state['ascending'])
+    df = df.sort(sort_state['column'], descending=not sort_state['ascending'])
 
-    return df.to_dict('records'), create_transaction_table(df, sort_state, filter_state, date_range_state), filter_state
+    return df.to_dicts(), create_transaction_table(df, sort_state, filter_state, date_range_state), filter_state
 
 @callback(
     [Output('transactions-data', 'data', allow_duplicate=True),
@@ -780,12 +779,12 @@ def sort_table(n_date, n_desc, n_amount, current_sort, filter_state, date_range_
 
     # Apply search filter if text is provided and filter_state exists
     if filter_state and isinstance(filter_state, dict) and filter_state.get('text'):
-        df = df[df[filter_state['column']].str.contains(filter_state['text'], case=False, na=False)]
+        df = df.filter(pl.col(filter_state['column']).str.contains(filter_state['text'], literal=True))
 
     # Apply sorting
-    df = df.sort_values(by=sort_column, ascending=ascending)
+    df = df.sort(sort_column, descending=not ascending)
 
-    return df.to_dict('records'), create_transaction_table(df, sort_state, filter_state, date_range_state), sort_state
+    return df.to_dicts(), create_transaction_table(df, sort_state, filter_state, date_range_state), sort_state
 
 @callback(
     Output("add-transaction-modal", "is_open"),
@@ -817,18 +816,18 @@ def update_transaction_count_plot(data):
         return go.Figure()
 
     # Convert data to DataFrame
-    df = pd.DataFrame(data)
-    df['Date'] = pd.to_datetime(df['Date'])
+    df = pl.DataFrame(data)
+    df = df.with_columns(pl.col('Date').cast(pl.Datetime))
 
     # Group by date and count transactions
-    daily_counts = df.groupby(df['Date'].dt.date).size().reset_index(name='count')
-    daily_counts['Date'] = pd.to_datetime(daily_counts['Date'])
+    daily_counts = df.group_by(pl.col('Date').dt.date()).agg(pl.count().alias('count'))
+    daily_counts = daily_counts.with_columns(pl.col('Date').cast(pl.Datetime))
 
     # Create the figure
     fig = go.Figure()
     fig.add_trace(go.Bar(
-        x=daily_counts['Date'],
-        y=daily_counts['count'],
+        x=daily_counts['Date'].to_list(),
+        y=daily_counts['count'].to_list(),
         name='Transactions per Day'
     ))
 

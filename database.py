@@ -1,10 +1,12 @@
 import sqlite3
 import os
 import time
-import pandas as pd
-from datetime import datetime
+import json
+import polars as pl
+from datetime import datetime, timedelta
 import threading
 from typing import Dict, Any
+import logging
 
 # Database setup
 DB_PATH = os.environ.get('HM_DB_PATH', 'transactions.db')
@@ -195,13 +197,13 @@ def get_tags():
     if not _is_cache_valid('tags'):
         conn = get_db_connection()
         try:
-            df = pd.read_sql_query("SELECT * FROM tags ORDER BY name", conn)
+            df = pl.read_database("SELECT * FROM tags ORDER BY name", conn)
             _update_cache('tags', df)
             return df
         finally:
             close_thread_connection()
     cached_data = _get_cache('tags')
-    return cached_data if cached_data is not None else pd.DataFrame()
+    return cached_data if cached_data is not None else pl.DataFrame()
 
 def add_tag(name, description, color):
     """Add a new tag to the database."""
@@ -281,10 +283,10 @@ def get_uploaded_files():
             c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='uploaded_files'")
             if not c.fetchone():
                 print("uploaded_files table does not exist")
-                return pd.DataFrame()
+                return pl.DataFrame()
 
             # Get the files
-            df = pd.read_sql_query("""
+            df = pl.read_database("""
                 SELECT filename, upload_date, transaction_count, sha_256
                 FROM uploaded_files
                 ORDER BY upload_date DESC
@@ -295,7 +297,7 @@ def get_uploaded_files():
         finally:
             close_thread_connection()
     cached_data = _get_cache('uploaded_files')
-    return cached_data if cached_data is not None else pd.DataFrame()
+    return cached_data if cached_data is not None else pl.DataFrame()
 
 def save_transactions(df, sha_256):
     """Save transactions to the database."""
@@ -344,12 +346,12 @@ def load_transactions():
     """Load all transactions from the database."""
     if not _is_cache_valid('transactions'):
         if not os.path.exists(DB_PATH):
-            return pd.DataFrame()
+            return pl.DataFrame()
 
         conn = get_db_connection()
         try:
             # Get transactions with their tags
-            df = pd.read_sql_query("""
+            df = pl.read_database("""
                 SELECT t.id, t.date, t.description, t.amount, t.notes,
                        GROUP_CONCAT(tg.name) as tags,
                        t.file_sha_256, f.filename
@@ -361,23 +363,22 @@ def load_transactions():
                 ORDER BY t.date DESC
             """, conn)
 
-            if not df.empty:
-                df['date'] = pd.to_datetime(df['date'])
-                df = df.rename(columns={
-                    'date': 'Date',
-                    'description': 'Description',
-                    'amount': 'Amount',
-                    'notes': 'Notes',
-                    'tags': 'Tags',
-                    'file_sha_256': 'File SHA-256',
-                    'filename': 'Source File'
-                })
+            if not df.is_empty():
+                df = df.with_columns([
+                    pl.col('date').str.to_datetime(format='%Y-%m-%d %H:%M:%S').alias('Date'),
+                    pl.col('description').alias('Description'),
+                    pl.col('amount').alias('Amount'),
+                    pl.col('notes').alias('Notes'),
+                    pl.col('tags').alias('Tags'),
+                    pl.col('file_sha_256').alias('File SHA-256'),
+                    pl.col('filename').alias('Source File')
+                ])
             _update_cache('transactions', df)
             return df
         finally:
             close_thread_connection()
     cached_data = _get_cache('transactions')
-    return cached_data if cached_data is not None else pd.DataFrame()
+    return cached_data if cached_data is not None else pl.DataFrame()
 
 def update_transaction_tags(transaction_id, tag_ids):
     """Update the tags of a transaction."""
@@ -516,27 +517,26 @@ def load_transactions_with_sort(sort_column='date', ascending=True, search_text=
             ORDER BY {column_map[sort_column]} {'ASC' if ascending else 'DESC'}
             """
 
-            df = pd.read_sql_query(query, conn)
+            df = pl.read_database(query, conn)
 
-            # Convert date strings to datetime
-            df['date'] = pd.to_datetime(df['date'])
-
-            # Rename columns to match expected format
-            df = df.rename(columns={
-                'date': 'Date',
-                'description': 'Description',
-                'amount': 'Amount',
-                'notes': 'Notes',
-                'tags': 'Tags',
-                'file_sha_256': 'File SHA-256',
-                'source_file': 'Source File'
-            })
+            # Convert date strings to datetime and rename columns
+            df = df.with_columns([
+                pl.col('date').str.to_datetime(format='%Y-%m-%d %H:%M:%S', strict=False)
+                .fill_null(pl.col('date').str.to_datetime(format='%Y-%m-%d', strict=False))
+                .alias('Date'),
+                pl.col('description').alias('Description'),
+                pl.col('amount').alias('Amount'),
+                pl.col('notes').alias('Notes'),
+                pl.col('tags').alias('Tags'),
+                pl.col('file_sha_256').alias('File SHA-256'),
+                pl.col('source_file').alias('Source File')
+            ])
             _update_cache(cache_key, df)
             return df
         finally:
             close_thread_connection()
     cached_data = _get_cache(cache_key)
-    return cached_data if cached_data is not None else pd.DataFrame()
+    return cached_data if cached_data is not None else pl.DataFrame()
 
 def delete_transactions(transaction_ids):
     """Delete multiple transactions by their IDs.
